@@ -399,6 +399,31 @@ tr.entry-row:hover td:last-child .row-actions { visibility: visible; opacity: 1;
   font-size: 13px; line-height: 2;
 }
 
+/* ── DONE SECTION SEPARATOR ── */
+.done-section-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; margin-bottom: 10px;
+  background: #f0fdf4; border: 1px solid #bbf7d0;
+  border-radius: 8px; color: var(--done-c);
+  font-size: 13px; font-weight: 600;
+}
+.done-section-icon {
+  width: 22px; height: 22px; background: var(--done-c); color: #fff;
+  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; flex-shrink: 0;
+}
+.done-section-count {
+  background: #dcfce7; color: var(--done-c); border-radius: 10px;
+  padding: 1px 8px; font-size: 12px; font-weight: 700;
+}
+.done-toggle-btn {
+  margin-left: auto; background: none; border: 1px solid #86efac;
+  border-radius: 5px; color: var(--done-c); padding: 3px 10px;
+  font-size: 11px; font-weight: 600; cursor: pointer; font-family: 'DM Sans', sans-serif;
+  transition: all 0.12s;
+}
+.done-toggle-btn:hover { background: #dcfce7; }
+
 /* ── AGENDA VIEW ── */
 .agenda-wrap { padding: 16px 20px; }
 .agenda-nav {
@@ -866,6 +891,35 @@ tr.entry-row:hover td:last-child .row-actions { visibility: visible; opacity: 1;
         </thead>
         <tbody id="table-body"></tbody>
       </table>
+
+      <!-- Section Terminé -->
+      <div id="done-section" style="display:none; margin-top:28px;">
+        <div class="done-section-header">
+          <span class="done-section-icon">✓</span>
+          <span>Terminé</span>
+          <span class="done-section-count" id="done-count">0</span>
+          <button class="done-toggle-btn" id="done-toggle-btn" onclick="toggleDoneSection()">Masquer</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th onclick="sortBy('created_at')">Date <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('canal')">Canal <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('prenom')">Prénom <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('service')">Service <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('type_demande')">Type <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('objet')">Objet <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('categorie')">Catégorie <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('priorite')">Priorité <span class="sort-icon">↕</span></th>
+              <th>Statut</th>
+              <th>Commentaire</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="table-body-done"></tbody>
+        </table>
+      </div>
+
     </div>
   </div>
 
@@ -987,9 +1041,7 @@ tr.entry-row:hover td:last-child .row-actions { visibility: visible; opacity: 1;
           <div class="field">
             <label>🔵 Statut</label>
             <select id="f-statut-sb">
-              <option value="todo">À faire</option>
-              <option value="inprogress">En cours</option>
-              <option value="done">Terminé</option>
+              <!-- Options générées dynamiquement depuis les colonnes Kanban -->
             </select>
           </div>
         </div>
@@ -1028,6 +1080,7 @@ let addingCol = false;
 window.addEventListener('fb-ready', async () => {
   await window._fb.ensureDefaultCols();
   document.getElementById('fb-loader').classList.add('hidden');
+  await loadKanbanColumns();
   await load();
 });
 
@@ -1097,6 +1150,8 @@ function invalidateAc() { acCache = {}; }
 async function load() {
   const p = buildParams();
   entries = await window._fb.getEntries(p);
+  syncStatutSelect();
+  syncStatutFilter();
   renderCurrent();
   loadStats();
   populateFilterDropdowns();
@@ -1177,17 +1232,31 @@ function renderCurrent() {
 // ═══════════════════════════════════════════════════════════════════════════
 //  TABLE
 // ═══════════════════════════════════════════════════════════════════════════
+let doneVisible = true;
+
+function toggleDoneSection() {
+  doneVisible = !doneVisible;
+  const tbody = document.getElementById('table-body-done');
+  const btn   = document.getElementById('done-toggle-btn');
+  tbody.style.display = doneVisible ? '' : 'none';
+  if (btn) btn.textContent = doneVisible ? 'Masquer' : 'Afficher';
+}
+
 function renderTable() {
   const sorted = [...entries].sort((a,b) => {
     const av = a[sortField]||'', bv = b[sortField]||'';
     return av < bv ? -sortDir : av > bv ? sortDir : 0;
   });
-  const tbody = document.getElementById('table-body');
-  if (!sorted.length) {
-    tbody.innerHTML = `<tr><td colspan="11"><div class="empty-table">Aucune entrée<br><small>Cliquez sur <strong>+ Nouvelle entrée</strong> pour commencer</small></div></td></tr>`;
-    return;
-  }
-  tbody.innerHTML = sorted.map(e => {
+
+  const active = sorted.filter(e => e.statut !== 'done');
+  const done   = sorted.filter(e => e.statut === 'done');
+
+  const tbody     = document.getElementById('table-body');
+  const tbodyDone = document.getElementById('table-body-done');
+  const doneSection = document.getElementById('done-section');
+  const doneCount   = document.getElementById('done-count');
+
+  function rowHtml(e) {
     const dt = e.created_at ? e.created_at.slice(0,16).replace('T',' ') : '';
     const [date, time] = dt.split(' ');
     return `<tr class="entry-row" onclick="editEntry('${e.id}')">
@@ -1206,7 +1275,26 @@ function renderTable() {
         <button class="row-btn del" title="Supprimer" onclick="deleteEntry('${e.id}')">✕</button>
       </div></td>
     </tr>`;
-  }).join('');
+  }
+
+  if (!sorted.length) {
+    tbody.innerHTML = `<tr><td colspan="11"><div class="empty-table">Aucune entrée<br><small>Cliquez sur <strong>+ Nouvelle entrée</strong> pour commencer</small></div></td></tr>`;
+    if (doneSection) doneSection.style.display = 'none';
+    return;
+  }
+
+  tbody.innerHTML = active.length
+    ? active.map(rowHtml).join('')
+    : `<tr><td colspan="11"><div class="empty-table" style="padding:30px">Toutes les entrées sont terminées ✓</div></td></tr>`;
+
+  if (done.length) {
+    tbodyDone.innerHTML = done.map(rowHtml).join('');
+    if (doneCount) doneCount.textContent = done.length;
+    if (doneSection) doneSection.style.display = '';
+    tbodyDone.style.display = doneVisible ? '' : 'none';
+  } else {
+    if (doneSection) doneSection.style.display = 'none';
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1285,7 +1373,20 @@ function goToday() { agendaDate = new Date(); weekOffset = 0; renderCurrent(); }
 // ═══════════════════════════════════════════════════════════════════════════
 //  SIDEBAR
 // ═══════════════════════════════════════════════════════════════════════════
+// Synchronise les options du <select> Statut avec les colonnes Kanban actuelles
+function syncStatutSelect() {
+  const sel = document.getElementById('f-statut-sb');
+  if (!sel) return;
+  const cols = kanbanColumns.length ? kanbanColumns : [
+    { slug: 'todo',       label: 'À faire' },
+    { slug: 'inprogress', label: 'En cours' },
+    { slug: 'done',       label: 'Terminé' },
+  ];
+  sel.innerHTML = cols.map(c => `<option value="${esc(c.slug)}">${esc(c.label)}</option>`).join('');
+}
+
 function openSidebar(entry=null) {
+  syncStatutSelect();
   const now = new Date();
   const pad = n => String(n).padStart(2,'0');
   const localNow = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
@@ -1365,6 +1466,21 @@ async function deleteEntry(id) {
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadKanbanColumns() {
   kanbanColumns = await window._fb.getCols();
+  syncStatutSelect();
+  syncStatutFilter();
+}
+
+function syncStatutFilter() {
+  const sel = document.getElementById('f-statut');
+  if (!sel) return;
+  const cur = sel.value;
+  const cols = kanbanColumns.length ? kanbanColumns : [
+    { slug: 'todo',       label: 'À faire' },
+    { slug: 'inprogress', label: 'En cours' },
+    { slug: 'done',       label: 'Terminé' },
+  ];
+  sel.innerHTML = '<option value="">Statut : Tous</option>' +
+    cols.map(c => `<option value="${esc(c.slug)}" ${c.slug === cur ? 'selected' : ''}>${esc(c.label)}</option>`).join('');
 }
 
 async function renderKanban() {
