@@ -1,0 +1,2060 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WorkLog</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,400;0,500;1,400&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<!-- ══════════════════════════════════════════════════════════════════
+     🔥 FIREBASE — remplace tes valeurs ci-dessous
+     1. Va sur https://console.firebase.google.com
+     2. Crée un projet → Firestore Database (mode production ou test)
+     3. Paramètres du projet → Tes applications → </> (Web) → copie firebaseConfig
+     ══════════════════════════════════════════════════════════════════ -->
+<script type="module">
+import { initializeApp }                        from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import {
+  getFirestore, collection, doc,
+  addDoc, setDoc, updateDoc, deleteDoc,
+  getDocs, getDoc, query, where,
+  orderBy, serverTimestamp, Timestamp
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+// ──────────────────────────────────────────────────────────────────────────
+//  ⚠️  REMPLACE ICI avec ta config Firebase
+// ──────────────────────────────────────────────────────────────────────────
+const firebaseConfig = {
+  apiKey:            "AIzaSyDkMoiojaqdoDyDr94C1EqaVQWprYvOnOo",
+  authDomain:        "worklog-29.firebaseapp.com",
+  projectId:         "worklog-29",
+  storageBucket:     "worklog-29.firebasestorage.app",
+  messagingSenderId: "770668035377",
+  appId:             "1:770668035377:web:a17ccfa67f318af7110410"
+};
+// ──────────────────────────────────────────────────────────────────────────
+
+const app = initializeApp(firebaseConfig);
+const db  = getFirestore(app);
+
+// ── Collections ────────────────────────────────────────────────────────────
+const ENTRIES_COL = 'entries';
+const COLS_COL    = 'kanban_columns';
+
+// ── Colonnes Kanban par défaut ─────────────────────────────────────────────
+const DEFAULT_COLS = [
+  { slug:'todo',       label:'À faire',   position:0, is_fixed:true  },
+  { slug:'inprogress', label:'En cours',  position:1, is_fixed:true  },
+  { slug:'waiting',    label:'En attente',position:2, is_fixed:false },
+  { slug:'done',       label:'Terminé',   position:3, is_fixed:true  },
+];
+
+async function ensureDefaultCols() {
+  const snap = await getDocs(collection(db, COLS_COL));
+  if (snap.empty) {
+    for (const c of DEFAULT_COLS) {
+      await addDoc(collection(db, COLS_COL), c);
+    }
+  }
+}
+
+// ── Helpers Firestore → objet JS ──────────────────────────────────────────
+function docToEntry(d) {
+  const data = d.data();
+  // Convertir Timestamp Firestore en string "YYYY-MM-DD HH:MM:SS"
+  let created_at = data.created_at;
+  if (created_at && typeof created_at.toDate === 'function') {
+    created_at = tsToStr(created_at.toDate());
+  }
+  return { id: d.id, ...data, created_at };
+}
+
+function docToCol(d) {
+  return { id: d.id, ...d.data() };
+}
+
+function tsToStr(date) {
+  // Afficher en heure locale (pas UTC)
+  const pad = n => String(n).padStart(2,'0');
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function strToTs(str) {
+  // "YYYY-MM-DD HH:MM:SS" ou "YYYY-MM-DDTHH:MM"
+  if (!str) return null;
+  return Timestamp.fromDate(new Date(str.replace(' ','T')));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  API FIRESTORE — remplace les appels fetch('/api/…')
+// ══════════════════════════════════════════════════════════════════════════
+
+// ENTRIES ─────────────────────────────────────────────────────────────────
+
+async function fbGetEntries(params = {}) {
+  let q = query(collection(db, ENTRIES_COL), orderBy('created_at', 'desc'));
+  const snap = await getDocs(q);
+  let rows = snap.docs.map(docToEntry);
+
+  // Filtres côté client (Firestore lite ne supporte pas tous les WHERE combinés)
+  if (params.search) {
+    const s = params.search.toLowerCase();
+    rows = rows.filter(e =>
+      [e.objet, e.prenom, e.service, e.commentaire].some(v => v && v.toLowerCase().includes(s))
+    );
+  }
+  if (params.canal)        rows = rows.filter(e => e.canal === params.canal);
+  if (params.type_demande) rows = rows.filter(e => e.type_demande === params.type_demande);
+  if (params.priorite)     rows = rows.filter(e => e.priorite === params.priorite);
+  if (params.statut)       rows = rows.filter(e => e.statut === params.statut);
+  if (params.prenom)       rows = rows.filter(e => e.prenom && e.prenom.toLowerCase().includes(params.prenom.toLowerCase()));
+  if (params.service)      rows = rows.filter(e => e.service && e.service.toLowerCase().includes(params.service.toLowerCase()));
+  if (params.date_from)    rows = rows.filter(e => e.created_at && e.created_at.slice(0,10) >= params.date_from);
+  if (params.date_to)      rows = rows.filter(e => e.created_at && e.created_at.slice(0,10) <= params.date_to);
+  return rows;
+}
+
+async function fbGetEntry(id) {
+  const d = await getDoc(doc(db, ENTRIES_COL, id));
+  return d.exists() ? docToEntry(d) : null;
+}
+
+async function fbAddEntry(data) {
+  const payload = {
+    ...data,
+    created_at: strToTs(data.created_at) || serverTimestamp(),
+    priorite: data.priorite || 'normal',
+    statut:   data.statut   || 'todo',
+  };
+  const ref = await addDoc(collection(db, ENTRIES_COL), payload);
+  return ref.id;
+}
+
+async function fbUpdateEntry(id, data) {
+  const payload = {
+    ...data,
+    created_at: strToTs(data.created_at) || serverTimestamp(),
+  };
+  await updateDoc(doc(db, ENTRIES_COL, id), payload);
+}
+
+async function fbPatchStatut(id, statut) {
+  await updateDoc(doc(db, ENTRIES_COL, id), { statut });
+}
+
+async function fbDeleteEntry(id) {
+  await deleteDoc(doc(db, ENTRIES_COL, id));
+}
+
+// STATS ───────────────────────────────────────────────────────────────────
+
+async function fbGetStats() {
+  const rows = await fbGetEntries();
+  const s = { total:0, urgent:0, todo:0, inprogress:0, done:0 };
+  rows.forEach(r => {
+    s.total++;
+    if (r.priorite === 'urgent')   s.urgent++;
+    if (r.statut === 'todo')       s.todo++;
+    if (r.statut === 'inprogress') s.inprogress++;
+    if (r.statut === 'done')       s.done++;
+  });
+  return s;
+}
+
+// AUTOCOMPLETE ────────────────────────────────────────────────────────────
+
+async function fbGetAc(field) {
+  const snap = await getDocs(collection(db, ENTRIES_COL));
+  const set = new Set();
+  snap.docs.forEach(d => {
+    const v = d.data()[field];
+    if (v) set.add(v);
+  });
+  return [...set].sort();
+}
+
+// KANBAN COLUMNS ──────────────────────────────────────────────────────────
+
+async function fbGetCols() {
+  const snap = await getDocs(query(collection(db, COLS_COL), orderBy('position','asc')));
+  return snap.docs.map(docToCol);
+}
+
+async function fbAddCol(label) {
+  const cols = await fbGetCols();
+  const maxPos = cols.length ? Math.max(...cols.map(c => c.position)) : -1;
+  const slug = slugify(label) + '_' + Date.now();
+  const ref = await addDoc(collection(db, COLS_COL), {
+    slug, label, position: maxPos + 1, is_fixed: false
+  });
+  return { id: ref.id, slug, label, position: maxPos + 1, is_fixed: false };
+}
+
+async function fbUpdateCol(id, label, oldSlug, isFixed) {
+  const newSlug = isFixed ? oldSlug : slugify(label) + '_' + id.slice(-4);
+  await updateDoc(doc(db, COLS_COL, id), { label, slug: newSlug });
+  if (!isFixed) {
+    // Mettre à jour les entrées qui avaient l'ancien slug
+    const snap = await getDocs(query(collection(db, ENTRIES_COL), where('statut','==', oldSlug)));
+    const batch = snap.docs.map(d => updateDoc(doc(db, ENTRIES_COL, d.id), { statut: newSlug }));
+    await Promise.all(batch);
+  }
+  return newSlug;
+}
+
+async function fbDeleteCol(id, slug) {
+  // Remettre les cartes en todo
+  const snap = await getDocs(query(collection(db, ENTRIES_COL), where('statut','==', slug)));
+  await Promise.all(snap.docs.map(d => updateDoc(doc(db, ENTRIES_COL, d.id), { statut: 'todo' })));
+  await deleteDoc(doc(db, COLS_COL, id));
+}
+
+async function fbReorderCols(items) {
+  await Promise.all(items.map(({ id, position }) =>
+    updateDoc(doc(db, COLS_COL, id), { position })
+  ));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  INIT — expose les fonctions sur window pour que le code HTML puisse les
+//  appeler (tout est module ES, donc sinon pas accessible globalement)
+// ══════════════════════════════════════════════════════════════════════════
+window._fb = {
+  getEntries: fbGetEntries,
+  getEntry:   fbGetEntry,
+  addEntry:   fbAddEntry,
+  updateEntry:fbUpdateEntry,
+  patchStatut:fbPatchStatut,
+  deleteEntry:fbDeleteEntry,
+  getStats:   fbGetStats,
+  getAc:      fbGetAc,
+  getCols:    fbGetCols,
+  addCol:     fbAddCol,
+  updateCol:  fbUpdateCol,
+  deleteCol:  fbDeleteCol,
+  reorderCols:fbReorderCols,
+  ensureDefaultCols,
+};
+window.dispatchEvent(new Event('fb-ready'));
+</script>
+
+<style>
+:root {
+  --bg: #f4f3ef;
+  --surface: #ffffff;
+  --surface2: #f9f8f5;
+  --border: #e2e0d8;
+  --border2: #ccc9be;
+  --text: #1a1916;
+  --text2: #6b6860;
+  --text3: #aaa89e;
+  --accent: #2563eb;
+  --accent-light: #eff6ff;
+  --urgent: #dc2626;
+  --urgent-light: #fef2f2;
+  --normal: #d97706;
+  --normal-light: #fffbeb;
+  --faible: #6b7280;
+  --faible-light: #f9fafb;
+  --todo-c: #6b7280;
+  --inprogress-c: #2563eb;
+  --done-c: #16a34a;
+  --sidebar-w: 440px;
+  --header-h: 52px;
+  --filters-h: 46px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; font-size: 14px; overflow-x: hidden; }
+
+/* ── LOADER ── */
+#fb-loader {
+  position: fixed; inset: 0; background: var(--bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; z-index: 9999; font-size: 14px; color: var(--text2);
+}
+#fb-loader .spin {
+  width: 32px; height: 32px; border: 3px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#fb-loader.hidden { display: none; }
+
+/* ── HEADER ── */
+header {
+  height: var(--header-h);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 20px; position: sticky; top: 0; z-index: 80;
+}
+.logo { font-weight: 700; font-size: 17px; letter-spacing: -0.3px; display: flex; align-items: center; gap: 8px; }
+.logo-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.stats-row { display: flex; gap: 16px; }
+.stat { font-size: 12px; color: var(--text2); display: flex; align-items: center; gap: 4px; }
+.stat strong { color: var(--text); font-weight: 600; }
+.stat.urgent strong { color: var(--urgent); }
+.btn-primary {
+  background: var(--accent); color: #fff; border: none;
+  padding: 8px 16px; border-radius: 6px; font-family: 'DM Sans', sans-serif;
+  font-size: 13px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px;
+  transition: background 0.15s;
+}
+.btn-primary:hover { background: #1d4ed8; }
+
+/* ── TABS ── */
+.tabs-bar {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 20px; gap: 2px; height: 40px;
+}
+.tab {
+  padding: 6px 14px; border-radius: 5px; font-size: 13px; font-weight: 500;
+  color: var(--text2); cursor: pointer; border: none; background: none;
+  transition: all 0.12s; display: flex; align-items: center; gap: 6px;
+}
+.tab:hover { background: var(--surface2); color: var(--text); }
+.tab.active { background: var(--accent-light); color: var(--accent); font-weight: 600; }
+
+/* ── FILTERS ── */
+.filters {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 20px; gap: 8px; height: var(--filters-h);
+  flex-wrap: wrap;
+}
+.filters input[type="text"], .filters select, .filters input[type="date"] {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text); padding: 5px 10px; font-family: 'DM Sans', sans-serif;
+  font-size: 12px; outline: none; transition: border 0.12s;
+}
+.filters input:focus, .filters select:focus { border-color: var(--accent); }
+.filters input[type="text"] { width: 140px; }
+.sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+.btn-ghost {
+  background: none; border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text2); padding: 5px 10px; font-size: 12px;
+  cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.12s;
+}
+.btn-ghost:hover { border-color: var(--border2); color: var(--text); }
+
+/* ── LAYOUT ── */
+.layout { display: flex; height: calc(100vh - var(--header-h) - 40px - var(--filters-h)); }
+.main-area { flex: 1; overflow: auto; }
+
+/* ── TABLE VIEW ── */
+.table-wrap { padding: 16px 20px; }
+table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+thead { background: var(--surface2); }
+th {
+  text-align: left; padding: 10px 12px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.8px; color: var(--text2);
+  border-bottom: 1px solid var(--border); white-space: nowrap; cursor: pointer;
+  user-select: none;
+}
+th:hover { color: var(--text); }
+th .sort-icon { margin-left: 4px; color: var(--text3); }
+td {
+  padding: 9px 12px; border-bottom: 1px solid var(--border);
+  font-size: 13px; vertical-align: middle;
+}
+tr:last-child td { border-bottom: none; }
+tr.entry-row { cursor: pointer; transition: background 0.1s; }
+tr.entry-row:hover { background: var(--surface2); }
+tr.entry-row:hover td:last-child .row-actions { visibility: visible; opacity: 1; }
+
+.td-date { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text2); white-space: nowrap; }
+.td-canal { white-space: nowrap; }
+.td-objet { max-width: 220px; }
+.td-objet span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.td-comment { max-width: 160px; color: var(--text2); font-size: 12px; }
+.td-comment span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.badge {
+  display: inline-flex; align-items: center; padding: 2px 8px;
+  border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap;
+}
+.badge-canal { background: #f1f5f9; color: #475569; }
+.badge-type { background: #f0fdf4; color: #15803d; }
+.badge-cat { background: #faf5ff; color: #7c3aed; }
+.badge-prio-urgent { background: var(--urgent-light); color: var(--urgent); }
+.badge-prio-normal { background: var(--normal-light); color: var(--normal); }
+.badge-prio-faible { background: var(--faible-light); color: var(--faible); }
+.badge-todo { background: #f1f5f9; color: var(--todo-c); }
+.badge-inprogress { background: var(--accent-light); color: var(--inprogress-c); }
+.badge-done { background: #f0fdf4; color: var(--done-c); }
+
+.row-actions { display: flex; gap: 4px; visibility: hidden; opacity: 0; transition: opacity 0.1s; }
+.row-btn {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text2); width: 26px; height: 26px; cursor: pointer; font-size: 12px;
+  display: flex; align-items: center; justify-content: center; transition: all 0.1s;
+}
+.row-btn:hover { border-color: var(--accent); color: var(--accent); }
+.row-btn.del:hover { border-color: var(--urgent); color: var(--urgent); }
+
+.empty-table {
+  text-align: center; padding: 60px 20px; color: var(--text3);
+  font-size: 13px; line-height: 2;
+}
+
+/* ── DONE SECTION SEPARATOR ── */
+.done-section-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; margin-bottom: 10px;
+  background: #f0fdf4; border: 1px solid #bbf7d0;
+  border-radius: 8px; color: var(--done-c);
+  font-size: 13px; font-weight: 600;
+}
+.done-section-icon {
+  width: 22px; height: 22px; background: var(--done-c); color: #fff;
+  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; flex-shrink: 0;
+}
+.done-section-count {
+  background: #dcfce7; color: var(--done-c); border-radius: 10px;
+  padding: 1px 8px; font-size: 12px; font-weight: 700;
+}
+.done-toggle-btn {
+  margin-left: auto; background: none; border: 1px solid #86efac;
+  border-radius: 5px; color: var(--done-c); padding: 3px 10px;
+  font-size: 11px; font-weight: 600; cursor: pointer; font-family: 'DM Sans', sans-serif;
+  transition: all 0.12s;
+}
+.done-toggle-btn:hover { background: #dcfce7; }
+
+/* ── AGENDA VIEW ── */
+.agenda-wrap { padding: 16px 20px; }
+.agenda-nav {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+}
+.agenda-nav button {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 5px;
+  padding: 6px 12px; cursor: pointer; font-size: 13px; transition: all 0.12s;
+}
+.agenda-nav button:hover { border-color: var(--border2); }
+.agenda-title { font-weight: 600; font-size: 15px; }
+
+/* Day view */
+.day-grid { background: var(--surface); border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+.day-slot { display: flex; border-bottom: 1px solid var(--border); min-height: 52px; }
+.day-slot:last-child { border-bottom: none; }
+.slot-hour {
+  width: 60px; flex-shrink: 0; padding: 6px 10px;
+  font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text3);
+  border-right: 1px solid var(--border); background: var(--surface2);
+  display: flex; align-items: flex-start; padding-top: 8px;
+}
+.slot-events { flex: 1; padding: 4px 8px; display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start; }
+.slot-now { background: #fffbeb; }
+.slot-hour.now-hour { color: var(--accent); font-weight: 600; }
+
+.agenda-chip {
+  background: var(--accent-light); border-left: 3px solid var(--accent);
+  border-radius: 4px; padding: 4px 8px; font-size: 12px; cursor: pointer;
+  transition: all 0.1s; max-width: 100%; min-width: 0;
+}
+.agenda-chip:hover { background: #dbeafe; }
+.agenda-chip.prio-urgent { background: var(--urgent-light); border-left-color: var(--urgent); }
+.agenda-chip.prio-faible { background: var(--faible-light); border-left-color: var(--faible); }
+.chip-top { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-sub { font-size: 11px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Week view */
+.week-grid { background: var(--surface); border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+.week-header { display: grid; border-bottom: 2px solid var(--border); }
+.week-header-cell {
+  padding: 10px 8px; text-align: center; font-size: 12px; font-weight: 600;
+  border-right: 1px solid var(--border); color: var(--text2);
+}
+.week-header-cell:last-child { border-right: none; }
+.week-header-cell.today { color: var(--accent); }
+.week-body { display: grid; }
+.week-row { display: grid; border-bottom: 1px solid var(--border); min-height: 40px; }
+.week-row:last-child { border-bottom: none; }
+.week-cell {
+  border-right: 1px solid var(--border); padding: 4px 6px;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.week-cell:first-child { background: var(--surface2); }
+.week-cell:last-child { border-right: none; }
+.week-hour { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--text3); padding-top: 2px; }
+.week-chip {
+  background: var(--accent-light); border-left: 2px solid var(--accent);
+  border-radius: 3px; padding: 2px 6px; font-size: 11px; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.week-chip:hover { background: #dbeafe; }
+.week-chip.prio-urgent { background: var(--urgent-light); border-left-color: var(--urgent); }
+
+/* ── KANBAN ── */
+#view-kanban { overflow: hidden !important; }
+.kanban-wrap {
+  padding: 16px 20px; display: flex; gap: 14px;
+  height: 100%; width: 100%;
+  overflow-x: auto; overflow-y: hidden;
+  align-items: flex-start;
+  box-sizing: border-box;
+}
+.kanban-col {
+  flex: 0 0 260px; background: var(--surface2); border-radius: 10px;
+  border: 1px solid var(--border); display: flex; flex-direction: column;
+  max-height: calc(100vh - var(--header-h) - 40px - var(--filters-h) - 32px);
+  transition: box-shadow 0.15s;
+}
+.kanban-col.drag-over {
+  box-shadow: 0 0 0 2px var(--accent); background: var(--accent-light);
+}
+.kanban-col-header {
+  padding: 10px 12px 8px; display: flex; align-items: center; gap: 6px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0; cursor: grab;
+}
+.kanban-col-header:active { cursor: grabbing; }
+.kanban-col-title {
+  font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.8px; color: var(--text2); flex: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.kanban-col-count {
+  background: var(--border); color: var(--text2); border-radius: 10px;
+  padding: 1px 7px; font-size: 11px; font-weight: 600; flex-shrink: 0;
+}
+.kanban-col-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
+.kanban-col:hover .kanban-col-actions { opacity: 1; }
+.kbtn {
+  background: none; border: none; cursor: pointer; color: var(--text3);
+  width: 22px; height: 22px; border-radius: 4px; display: flex;
+  align-items: center; justify-content: center; font-size: 12px; transition: all 0.1s;
+}
+.kbtn:hover { background: var(--border); color: var(--text); }
+.kbtn.del:hover { background: var(--urgent-light); color: var(--urgent); }
+
+.kanban-cards {
+  flex: 1; overflow-y: auto; padding: 8px; display: flex;
+  flex-direction: column; gap: 6px; min-height: 60px;
+}
+.kanban-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+  padding: 9px 11px; cursor: grab; user-select: none;
+  transition: box-shadow 0.12s, transform 0.12s; position: relative;
+}
+.kanban-card:active { cursor: grabbing; }
+.kanban-card.dragging { opacity: 0.4; transform: scale(0.98); }
+.kanban-card:hover { box-shadow: 0 3px 10px rgba(0,0,0,0.08); border-color: var(--border2); }
+.kcard-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; margin-bottom: 5px; }
+.kcard-objet { font-size: 13px; font-weight: 600; color: var(--text); line-height: 1.3; }
+.kcard-prio {
+  flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; margin-top: 3px;
+}
+.kcard-prio.urgent { background: var(--urgent); }
+.kcard-prio.normal { background: var(--normal); }
+.kcard-prio.faible { background: var(--faible); }
+.kcard-meta { font-size: 11px; color: var(--text2); display: flex; flex-wrap: wrap; gap: 4px; }
+.kcard-tag {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 3px;
+  padding: 1px 5px; font-size: 10px; color: var(--text2);
+}
+.kcard-date { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--text3); margin-top: 5px; }
+.kcard-edit {
+  position: absolute; top: 6px; right: 6px; opacity: 0;
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 4px;
+  width: 22px; height: 22px; font-size: 11px; cursor: pointer; color: var(--text2);
+  display: flex; align-items: center; justify-content: center; transition: all 0.1s;
+}
+.kanban-card:hover .kcard-edit { opacity: 1; }
+.kcard-edit:hover { border-color: var(--accent); color: var(--accent); }
+
+.kanban-add-col {
+  flex: 0 0 200px; border: 2px dashed var(--border); border-radius: 10px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; cursor: pointer; color: var(--text3); transition: all 0.15s;
+  min-height: 100px; padding: 20px; align-self: flex-start;
+}
+.kanban-add-col:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-light); }
+.kanban-add-col-icon { font-size: 22px; }
+.kanban-add-col-text { font-size: 12px; font-weight: 600; }
+
+.kanban-add-col-form {
+  flex: 0 0 200px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px; display: flex; flex-direction: column;
+  gap: 8px; align-self: flex-start;
+}
+.kanban-add-col-form input {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text); padding: 6px 10px; font-family: 'DM Sans', sans-serif;
+  font-size: 12px; outline: none; width: 100%;
+}
+.kanban-add-col-form input:focus { border-color: var(--accent); }
+.kanban-add-col-form-btns { display: flex; gap: 6px; }
+.kanban-empty {
+  text-align: center; color: var(--text3); font-size: 12px; padding: 20px 10px; line-height: 1.8;
+}
+.kanban-col.col-dragging { opacity: 0.5; }
+.kanban-col-title-input {
+  font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.8px; color: var(--text2); flex: 1; background: var(--surface);
+  border: 1px solid var(--accent); border-radius: 4px; padding: 2px 6px;
+  font-family: 'DM Sans', sans-serif; outline: none;
+}
+
+/* ── SIDEBAR ── */
+.sidebar {
+  width: 0; overflow: hidden; background: var(--surface);
+  border-left: 1px solid var(--border);
+  transition: width 0.25s cubic-bezier(0.4,0,0.2,1);
+  display: flex; flex-direction: column; flex-shrink: 0;
+}
+.sidebar.open { width: var(--sidebar-w); }
+.sidebar-inner { width: var(--sidebar-w); display: flex; flex-direction: column; height: 100%; }
+.sidebar-header {
+  padding: 16px 20px; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
+}
+.sidebar-title { font-weight: 700; font-size: 15px; }
+.btn-close {
+  background: none; border: none; font-size: 18px; cursor: pointer;
+  color: var(--text2); width: 30px; height: 30px; display: flex;
+  align-items: center; justify-content: center; border-radius: 5px;
+}
+.btn-close:hover { background: var(--surface2); color: var(--text); }
+.sidebar-body { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+.sidebar-footer {
+  padding: 16px 20px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; flex-shrink: 0;
+}
+
+/* FORM FIELDS */
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text2); }
+.field input, .field select, .field textarea {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); padding: 8px 11px; font-family: 'DM Sans', sans-serif;
+  font-size: 13px; outline: none; width: 100%; transition: border 0.12s;
+}
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent); background: #fff; }
+.field textarea { resize: vertical; min-height: 64px; }
+.field-row  { display: grid; grid-template-columns: 1fr 1fr;     gap: 12px; }
+.field-row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+
+/* AUTOCOMPLETE */
+.ac-wrap { position: relative; }
+.ac-list {
+  display: none; position: absolute; top: calc(100% + 2px); left: 0; right: 0;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08); z-index: 200; max-height: 180px; overflow-y: auto;
+}
+.ac-list.show { display: block; }
+.ac-item {
+  padding: 7px 11px; font-size: 13px; cursor: pointer; border-bottom: 1px solid var(--border);
+}
+.ac-item:last-child { border-bottom: none; }
+.ac-item:hover { background: var(--accent-light); }
+.ac-new { color: var(--accent); font-style: italic; }
+.ac-new span { font-weight: 600; }
+
+/* BUTTONS */
+.btn-save {
+  background: var(--accent); color: #fff; border: none;
+  padding: 9px 18px; border-radius: 6px; font-family: 'DM Sans', sans-serif;
+  font-size: 13px; font-weight: 600; cursor: pointer; flex: 1;
+  transition: background 0.15s;
+}
+.btn-save:hover { background: #1d4ed8; }
+.btn-save:disabled { background: #93c5fd; cursor: not-allowed; }
+.btn-cancel {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  padding: 9px 16px; font-family: 'DM Sans', sans-serif; font-size: 13px;
+  cursor: pointer; color: var(--text2); transition: all 0.12s;
+}
+.btn-cancel:hover { border-color: var(--border2); color: var(--text); }
+
+/* ── STATS DASHBOARD ── */
+.stats-dashboard {
+  padding: 24px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: 20px;
+  align-items: start;
+}
+.stats-loading {
+  grid-column: 1/-1;
+  display: flex; align-items: center; justify-content: center;
+  gap: 12px; color: var(--text2); padding: 60px;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+  transition: box-shadow 0.15s;
+}
+.stat-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+.stat-card.wide { grid-column: span 2; }
+.stat-card-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--text2); margin-bottom: 16px;
+  display: flex; align-items: center; gap: 7px;
+}
+.stat-card-title span { font-size: 14px; }
+.stat-card-total {
+  font-size: 11px; color: var(--text3); margin-left: auto;
+  font-weight: 500; text-transform: none; letter-spacing: 0;
+}
+/* Donut */
+.donut-wrap { display: flex; align-items: center; gap: 20px; }
+.donut-legend { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.donut-leg-item { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.donut-leg-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.donut-leg-label { flex: 1; color: var(--text2); }
+.donut-leg-val { font-weight: 700; color: var(--text); font-size: 13px; }
+.donut-leg-pct { color: var(--text3); font-size: 11px; }
+/* Bars horizontal */
+.hbar-list { display: flex; flex-direction: column; gap: 10px; }
+.hbar-item { display: flex; flex-direction: column; gap: 4px; }
+.hbar-header { display: flex; justify-content: space-between; font-size: 12px; }
+.hbar-label { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+.hbar-val { color: var(--text2); font-size: 11px; }
+.hbar-track { background: var(--surface2); border-radius: 99px; height: 7px; overflow: hidden; }
+.hbar-fill { height: 100%; border-radius: 99px; transition: width 0.6s cubic-bezier(0.34,1.56,0.64,1); }
+/* Vertical bars */
+.vbar-wrap { display: flex; align-items: flex-end; gap: 8px; height: 140px; padding-bottom: 24px; position: relative; }
+.vbar-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; height: 100%; justify-content: flex-end; }
+.vbar-bar { width: 100%; border-radius: 5px 5px 0 0; min-height: 4px; transition: height 0.6s cubic-bezier(0.34,1.56,0.64,1); position: relative; }
+.vbar-bar:hover::after {
+  content: attr(data-tip);
+  position: absolute; bottom: calc(100% + 4px); left: 50%; transform: translateX(-50%);
+  background: #1a1916; color: #fff; padding: 3px 8px; border-radius: 4px;
+  font-size: 11px; white-space: nowrap; z-index: 10; pointer-events: none;
+}
+.vbar-val { font-size: 10px; color: var(--text3); font-weight: 600; }
+.vbar-lbl { font-size: 9px; color: var(--text3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 48px; text-align: center; position: absolute; bottom: 0; }
+/* Pie */
+.pie-wrap { display: flex; align-items: center; gap: 20px; }
+.pie-legend { display: flex; flex-direction: column; gap: 7px; flex: 1; }
+.pie-leg-item { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.pie-leg-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.pie-leg-label { flex: 1; color: var(--text); }
+.pie-leg-val { font-weight: 700; color: var(--text); }
+/* Ranking */
+.ranking-list { display: flex; flex-direction: column; gap: 8px; }
+.rank-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px; background: var(--surface2); }
+.rank-num { font-size: 11px; font-weight: 700; color: var(--text3); width: 18px; text-align: center; }
+.rank-avatar {
+  width: 28px; height: 28px; border-radius: 50%; background: var(--accent-light);
+  color: var(--accent); font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.rank-name { flex: 1; font-size: 13px; font-weight: 500; color: var(--text); }
+.rank-bar-wrap { width: 80px; }
+.rank-bar-track { background: var(--border); border-radius: 99px; height: 5px; }
+.rank-bar-fill { height: 100%; border-radius: 99px; background: var(--accent); }
+.rank-val { font-size: 12px; font-weight: 700; color: var(--accent); min-width: 20px; text-align: right; }
+/* Treemap */
+.treemap-wrap { position: relative; width: 100%; height: 200px; border-radius: 8px; overflow: hidden; }
+.treemap-cell {
+  position: absolute; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; cursor: default; transition: filter 0.15s;
+  padding: 4px; text-align: center; overflow: hidden;
+}
+.treemap-cell:hover { filter: brightness(1.1); z-index: 2; }
+.treemap-cell-label { font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.95); text-shadow: 0 1px 2px rgba(0,0,0,0.3); line-height: 1.2; }
+.treemap-cell-val { font-size: 10px; color: rgba(255,255,255,0.75); }
+/* No data */
+.no-data { color: var(--text3); font-size: 13px; text-align: center; padding: 30px 0; }
+
+.toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: #1a1916; color: #fff; padding: 10px 18px; border-radius: 7px;
+  font-size: 13px; font-weight: 500; z-index: 9999;
+  animation: fadeInUp 0.2s ease, fadeOut 0.3s 1.8s forwards;
+}
+@keyframes fadeInUp { from { opacity:0; transform: translateX(-50%) translateY(6px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
+@keyframes fadeOut  { to { opacity: 0; } }
+
+/* ── HEATMAP HORAIRES ── */
+.heatmap-outer { overflow-x: auto; padding-bottom: 4px; }
+.heatmap-table { border-collapse: separate; border-spacing: 3px; width: 100%; }
+.hm-corner { width: 36px; }
+.hm-hour-label {
+  font-size: 9px; color: var(--text3); text-align: center;
+  font-family: 'DM Mono', monospace; padding-bottom: 4px; white-space: nowrap;
+}
+.hm-day-label {
+  font-size: 10px; font-weight: 700; color: var(--text2);
+  white-space: nowrap; padding-right: 8px; text-align: right;
+}
+.hm-cell {
+  width: 100%; height: 28px; border-radius: 4px;
+  cursor: default; transition: transform 0.1s, filter 0.1s;
+  position: relative;
+}
+.hm-cell:hover { transform: scale(1.15); filter: brightness(1.08); z-index: 5; }
+.hm-cell-inner {
+  width: 100%; height: 100%; border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 9px; font-weight: 700;
+}
+.heatmap-peaks { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.hm-peak-badge {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 10px; font-size: 11px;
+  display: flex; align-items: center; gap: 5px; color: var(--text2);
+}
+.hm-peak-badge strong { color: var(--accent); font-size: 12px; }
+.heatmap-legend-row {
+  display: flex; align-items: center; gap: 5px; margin-top: 10px;
+  font-size: 10px; color: var(--text3);
+}
+.hm-leg-box { width: 16px; height: 16px; border-radius: 3px; }
+
+</style>
+</head>
+<body>
+
+<!-- Écran de chargement Firebase -->
+<div id="fb-loader">
+  <div class="spin"></div>
+  <div>Connexion à Firebase…</div>
+</div>
+
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    WorkLog
+  </div>
+  <div class="header-right">
+    <div class="stats-row">
+      <div class="stat urgent"><strong id="s-urgent">0</strong> urgent</div>
+      <div class="stat"><strong id="s-todo">0</strong> à faire</div>
+      <div class="stat"><strong id="s-prog">0</strong> en cours</div>
+      <div class="stat"><strong id="s-done">0</strong> terminé</div>
+      <div class="stat"><strong id="s-total">0</strong> total</div>
+    </div>
+    <button class="btn-primary" onclick="openSidebar()">＋ Nouvelle entrée</button>
+  </div>
+</header>
+
+<div class="tabs-bar">
+  <button class="tab active" id="tab-table"  onclick="switchView('table')">☰ Tableau</button>
+  <button class="tab" id="tab-day"    onclick="switchView('day')">📅 Jour</button>
+  <button class="tab" id="tab-week"   onclick="switchView('week')">🗓 Semaine</button>
+  <button class="tab" id="tab-kanban" onclick="switchView('kanban')">⬛ Kanban</button>
+  <button class="tab" id="tab-stats"  onclick="switchView('stats')">📊 Statistiques</button>
+</div>
+
+<div class="filters">
+  <input type="text" id="f-search" placeholder="🔍 Rechercher…" oninput="applyFilters()" style="width:180px">
+  <div class="sep"></div>
+  <select id="f-canal" onchange="applyFilters()"><option value="">Canal : Tous</option></select>
+  <select id="f-type"  onchange="applyFilters()"><option value="">Type : Tous</option></select>
+  <select id="f-prio"  onchange="applyFilters()">
+    <option value="">Priorité : Toutes</option>
+    <option value="urgent">Urgent</option>
+    <option value="normal">Normal</option>
+    <option value="faible">Faible</option>
+  </select>
+  <select id="f-statut" onchange="applyFilters()">
+    <option value="">Statut : Tous</option>
+    <option value="todo">À faire</option>
+    <option value="inprogress">En cours</option>
+    <option value="done">Terminé</option>
+  </select>
+  <input type="text" id="f-prenom"  placeholder="Prénom…"  oninput="applyFilters()">
+  <input type="text" id="f-service" placeholder="Service…" oninput="applyFilters()">
+  <div class="sep"></div>
+  <input type="date" id="f-from" onchange="applyFilters()" title="Depuis">
+  <input type="date" id="f-to"   onchange="applyFilters()" title="Jusqu'à">
+  <button class="btn-ghost" onclick="resetFilters()">✕ Reset</button>
+</div>
+
+<div class="layout">
+  <!-- TABLE VIEW -->
+  <div class="main-area" id="view-table">
+    <div class="table-wrap">
+      <table id="main-table">
+        <thead>
+          <tr>
+            <th onclick="sortBy('created_at')">Date / Heure <span class="sort-icon">↕</span></th>
+            <th>Canal</th>
+            <th onclick="sortBy('prenom')">Prénom <span class="sort-icon">↕</span></th>
+            <th onclick="sortBy('service')">Service <span class="sort-icon">↕</span></th>
+            <th>Type</th>
+            <th>Objet</th>
+            <th onclick="sortBy('categorie')">Catégorie <span class="sort-icon">↕</span></th>
+            <th onclick="sortBy('priorite')">Priorité <span class="sort-icon">↕</span></th>
+            <th onclick="sortBy('statut')">Statut <span class="sort-icon">↕</span></th>
+            <th>Commentaire</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="table-body"></tbody>
+      </table>
+
+      <!-- Section Terminé -->
+      <div id="done-section" style="display:none; margin-top:28px;">
+        <div class="done-section-header">
+          <span class="done-section-icon">✓</span>
+          <span>Terminé</span>
+          <span class="done-section-count" id="done-count">0</span>
+          <button class="done-toggle-btn" id="done-toggle-btn" onclick="toggleDoneSection()">Masquer</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th onclick="sortBy('created_at')">Date <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('canal')">Canal <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('prenom')">Prénom <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('service')">Service <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('type_demande')">Type <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('objet')">Objet <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('categorie')">Catégorie <span class="sort-icon">↕</span></th>
+              <th onclick="sortBy('priorite')">Priorité <span class="sort-icon">↕</span></th>
+              <th>Statut</th>
+              <th>Commentaire</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="table-body-done"></tbody>
+        </table>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- DAY VIEW -->
+  <div class="main-area" id="view-day" style="display:none">
+    <div class="agenda-wrap">
+      <div class="agenda-nav">
+        <button onclick="agendaNav(-1)">‹ Préc.</button>
+        <div class="agenda-title" id="day-title"></div>
+        <button onclick="agendaNav(1)">Suiv. ›</button>
+        <button class="btn-ghost" onclick="goToday()">Aujourd'hui</button>
+      </div>
+      <div class="day-grid" id="day-grid"></div>
+    </div>
+  </div>
+
+  <!-- WEEK VIEW -->
+  <div class="main-area" id="view-week" style="display:none">
+    <div class="agenda-wrap">
+      <div class="agenda-nav">
+        <button onclick="weekNav(-1)">‹ Préc.</button>
+        <div class="agenda-title" id="week-title"></div>
+        <button onclick="weekNav(1)">Suiv. ›</button>
+        <button class="btn-ghost" onclick="goToday()">Cette semaine</button>
+      </div>
+      <div class="week-grid" id="week-grid"></div>
+    </div>
+  </div>
+
+  <!-- KANBAN VIEW -->
+  <div class="main-area" id="view-kanban" style="display:none; overflow:hidden">
+    <div class="kanban-wrap" id="kanban-wrap"></div>
+  </div>
+
+  <!-- STATS VIEW -->
+  <div class="main-area" id="view-stats" style="display:none; overflow-y:auto">
+    <div class="stats-dashboard" id="stats-dashboard">
+      <div class="stats-loading">
+        <div class="spin"></div>
+        <span>Chargement des statistiques…</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- SIDEBAR -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-inner">
+      <div class="sidebar-header">
+        <div class="sidebar-title" id="sb-title">Nouvelle entrée</div>
+        <button class="btn-close" onclick="closeSidebar()">✕</button>
+      </div>
+      <div class="sidebar-body">
+        <input type="hidden" id="edit-id">
+
+        <div class="field">
+          <label>📅 Date / Heure</label>
+          <input type="datetime-local" id="f-datetime">
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>📡 Canal</label>
+            <div class="ac-wrap">
+              <input type="text" id="f-canal-sb" placeholder="Mail, Teams…" autocomplete="off" oninput="acInput('canal')" onfocus="acInput('canal')" onblur="acBlur('canal')">
+              <div class="ac-list" id="ac-canal"></div>
+            </div>
+          </div>
+          <div class="field">
+            <label>📂 Type de demande</label>
+            <div class="ac-wrap">
+              <input type="text" id="f-type_demande" placeholder="Incident, Question…" autocomplete="off" oninput="acInput('type_demande')" onfocus="acInput('type_demande')" onblur="acBlur('type_demande')">
+              <div class="ac-list" id="ac-type_demande"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>👤 Prénom</label>
+            <div class="ac-wrap">
+              <input type="text" id="f-prenom-sb" placeholder="Prénom…" autocomplete="off" oninput="acInput('prenom')" onfocus="acInput('prenom')" onblur="acBlur('prenom')">
+              <div class="ac-list" id="ac-prenom"></div>
+            </div>
+          </div>
+          <div class="field">
+            <label>🏢 Service</label>
+            <div class="ac-wrap">
+              <input type="text" id="f-service-sb" placeholder="IT, RH…" autocomplete="off" oninput="acInput('service')" onfocus="acInput('service')" onblur="acBlur('service')">
+              <div class="ac-list" id="ac-service"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>📋 Objet (court)</label>
+          <div class="ac-wrap">
+            <input type="text" id="f-objet" placeholder="Résumé en une phrase…" autocomplete="off" oninput="acInput('objet')" onfocus="acInput('objet')" onblur="acBlur('objet')">
+            <div class="ac-list" id="ac-objet"></div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>🏷 Catégorie</label>
+          <div class="ac-wrap">
+            <input type="text" id="f-categorie" placeholder="Technique, Projet…" autocomplete="off" oninput="acInput('categorie')" onfocus="acInput('categorie')" onblur="acBlur('categorie')">
+            <div class="ac-list" id="ac-categorie"></div>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>🔴 Priorité</label>
+            <select id="f-priorite">
+              <option value="normal">Normal</option>
+              <option value="urgent">Urgent !</option>
+              <option value="faible">Faible</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>🔵 Statut</label>
+            <select id="f-statut-sb">
+              <!-- Options générées dynamiquement depuis les colonnes Kanban -->
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>💬 Commentaire rapide</label>
+          <textarea id="f-commentaire" placeholder="Contexte, suite à donner, réponse apportée…"></textarea>
+        </div>
+      </div>
+      <div class="sidebar-footer">
+        <button class="btn-cancel" onclick="closeSidebar()">Annuler</button>
+        <button class="btn-save" id="btn-save" onclick="saveEntry()">Enregistrer</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════════════════════
+let entries     = [];
+let acCache     = {};
+let currentView = 'table';
+let sortField   = 'created_at', sortDir = -1;
+let agendaDate  = new Date();
+let weekOffset  = 0;
+let kanbanColumns = [];
+let dragCard = null;
+let dragCol  = null;
+let addingCol = false;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ATTENDRE QUE FIREBASE SOIT PRÊT
+// ═══════════════════════════════════════════════════════════════════════════
+window.addEventListener('fb-ready', async () => {
+  await window._fb.ensureDefaultCols();
+  document.getElementById('fb-loader').classList.add('hidden');
+  await loadKanbanColumns();
+  await load();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  AUTOCOMPLETE
+// ═══════════════════════════════════════════════════════════════════════════
+// Mapping champ → id input (les champs sidebar ont des ids différents des filtres)
+const FIELD_INPUT = {
+  canal:        'f-canal-sb',
+  type_demande: 'f-type_demande',
+  prenom:       'f-prenom-sb',
+  service:      'f-service-sb',
+  objet:        'f-objet',
+  categorie:    'f-categorie',
+};
+
+async function getAc(field) {
+  if (!acCache[field]) {
+    acCache[field] = await window._fb.getAc(field);
+  }
+  return acCache[field];
+}
+
+async function acInput(field) {
+  const inputId = FIELD_INPUT[field];
+  const inp  = document.getElementById(inputId);
+  const list = document.getElementById('ac-' + field);
+  if (!inp || !list) return;
+  const val = inp.value.toLowerCase();
+  const all = await getAc(field);
+  const filtered = all.filter(v => v.toLowerCase().includes(val));
+
+  list.innerHTML = '';
+  if (filtered.length === 0 && val.length === 0) { list.classList.remove('show'); return; }
+
+  filtered.slice(0,10).forEach(v => {
+    const div = document.createElement('div');
+    div.className = 'ac-item';
+    div.textContent = v;
+    div.onmousedown = () => { inp.value = v; list.classList.remove('show'); };
+    list.appendChild(div);
+  });
+
+  if (val && !filtered.find(v => v.toLowerCase() === val)) {
+    const div = document.createElement('div');
+    div.className = 'ac-item ac-new';
+    div.innerHTML = `Ajouter <span>"${inp.value}"</span>`;
+    div.onmousedown = () => { list.classList.remove('show'); };
+    list.appendChild(div);
+  }
+
+  list.classList.toggle('show', list.children.length > 0);
+}
+
+function acBlur(field) {
+  setTimeout(() => {
+    const list = document.getElementById('ac-' + field);
+    if (list) list.classList.remove('show');
+  }, 150);
+}
+
+function invalidateAc() { acCache = {}; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LOAD
+// ═══════════════════════════════════════════════════════════════════════════
+async function load() {
+  const p = buildParams();
+  entries = await window._fb.getEntries(p);
+  syncStatutSelect();
+  syncStatutFilter();
+  renderCurrent();
+  loadStats();
+  populateFilterDropdowns();
+}
+
+function buildParams() {
+  const p = {};
+  const s = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  if (s('f-search'))  p.search        = s('f-search');
+  if (s('f-canal'))   p.canal         = s('f-canal');
+  if (s('f-type'))    p.type_demande  = s('f-type');
+  if (s('f-prio'))    p.priorite      = s('f-prio');
+  if (s('f-statut'))  p.statut        = s('f-statut');
+  if (s('f-prenom'))  p.prenom        = s('f-prenom');
+  if (s('f-service')) p.service       = s('f-service');
+  if (s('f-from'))    p.date_from     = s('f-from');
+  if (s('f-to'))      p.date_to       = s('f-to');
+  return p;
+}
+
+async function populateFilterDropdowns() {
+  const canals = await getAc('canal');
+  const types  = await getAc('type_demande');
+  const fCanal = document.getElementById('f-canal');
+  const fType  = document.getElementById('f-type');
+  const curCanal = fCanal.value, curType = fType.value;
+  fCanal.innerHTML = '<option value="">Canal : Tous</option>' + canals.map(v => `<option value="${esc(v)}" ${v===curCanal?'selected':''}>${esc(v)}</option>`).join('');
+  fType.innerHTML  = '<option value="">Type : Tous</option>'  + types.map(v => `<option value="${esc(v)}" ${v===curType?'selected':''}>${esc(v)}</option>`).join('');
+}
+
+function applyFilters() { load(); }
+function resetFilters() {
+  ['f-search','f-prenom','f-service','f-from','f-to'].forEach(id => document.getElementById(id).value = '');
+  ['f-canal','f-type','f-prio','f-statut'].forEach(id => document.getElementById(id).value = '');
+  load();
+}
+
+async function loadStats() {
+  const s = await window._fb.getStats();
+  document.getElementById('s-urgent').textContent = s.urgent || 0;
+  document.getElementById('s-todo').textContent   = s.todo   || 0;
+  document.getElementById('s-prog').textContent   = s.inprogress || 0;
+  document.getElementById('s-done').textContent   = s.done   || 0;
+  document.getElementById('s-total').textContent  = s.total  || 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SORT
+// ═══════════════════════════════════════════════════════════════════════════
+function sortBy(field) {
+  if (sortField === field) sortDir *= -1;
+  else { sortField = field; sortDir = -1; }
+  renderTable();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VIEWS
+// ═══════════════════════════════════════════════════════════════════════════
+function switchView(v) {
+  currentView = v;
+  ['table','day','week','kanban','stats'].forEach(id => {
+    const el = document.getElementById('view-'+id);
+    if (el) el.style.display = id === v ? (id==='kanban'?'flex':'block') : 'none';
+    const tab = document.getElementById('tab-'+id);
+    if (tab) tab.classList.toggle('active', id === v);
+  });
+  if (v === 'stats') renderStats();
+  else renderCurrent();
+}
+
+function renderCurrent() {
+  if      (currentView === 'table')  renderTable();
+  else if (currentView === 'day')    renderDay();
+  else if (currentView === 'week')   renderWeek();
+  else if (currentView === 'kanban') renderKanban();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TABLE
+// ═══════════════════════════════════════════════════════════════════════════
+let doneVisible = true;
+
+function toggleDoneSection() {
+  doneVisible = !doneVisible;
+  const tbody = document.getElementById('table-body-done');
+  const btn   = document.getElementById('done-toggle-btn');
+  tbody.style.display = doneVisible ? '' : 'none';
+  if (btn) btn.textContent = doneVisible ? 'Masquer' : 'Afficher';
+}
+
+function renderTable() {
+  const sorted = [...entries].sort((a,b) => {
+    const av = a[sortField]||'', bv = b[sortField]||'';
+    return av < bv ? -sortDir : av > bv ? sortDir : 0;
+  });
+
+  const active = sorted.filter(e => e.statut !== 'done');
+  const done   = sorted.filter(e => e.statut === 'done');
+
+  const tbody     = document.getElementById('table-body');
+  const tbodyDone = document.getElementById('table-body-done');
+  const doneSection = document.getElementById('done-section');
+  const doneCount   = document.getElementById('done-count');
+
+  function rowHtml(e) {
+    const dt = e.created_at ? e.created_at.slice(0,16).replace('T',' ') : '';
+    const [date, time] = dt.split(' ');
+    return `<tr class="entry-row" onclick="editEntry('${e.id}')">
+      <td class="td-date">${date||''}<br><span style="color:var(--accent);font-weight:500">${time||''}</span></td>
+      <td class="td-canal">${e.canal ? `<span class="badge badge-canal">${esc(e.canal)}</span>` : ''}</td>
+      <td>${esc(e.prenom||'')}</td>
+      <td><span style="font-size:12px;color:var(--text2)">${esc(e.service||'')}</span></td>
+      <td>${e.type_demande ? `<span class="badge badge-type">${esc(e.type_demande)}</span>` : ''}</td>
+      <td class="td-objet"><span title="${esc(e.objet||'')}">${esc(e.objet||'')}</span></td>
+      <td>${e.categorie ? `<span class="badge badge-cat">${esc(e.categorie)}</span>` : ''}</td>
+      <td><span class="badge badge-prio-${e.priorite||'normal'}">${prioLabel(e.priorite)}</span></td>
+      <td><span class="badge badge-${e.statut||'todo'}">${statutLabel(e.statut)}</span></td>
+      <td class="td-comment"><span title="${esc(e.commentaire||'')}">${esc(e.commentaire||'')}</span></td>
+      <td onclick="event.stopPropagation()"><div class="row-actions">
+        <button class="row-btn" title="Modifier"    onclick="editEntry('${e.id}')">✎</button>
+        <button class="row-btn del" title="Supprimer" onclick="deleteEntry('${e.id}')">✕</button>
+      </div></td>
+    </tr>`;
+  }
+
+  if (!sorted.length) {
+    tbody.innerHTML = `<tr><td colspan="11"><div class="empty-table">Aucune entrée<br><small>Cliquez sur <strong>+ Nouvelle entrée</strong> pour commencer</small></div></td></tr>`;
+    if (doneSection) doneSection.style.display = 'none';
+    return;
+  }
+
+  tbody.innerHTML = active.length
+    ? active.map(rowHtml).join('')
+    : `<tr><td colspan="11"><div class="empty-table" style="padding:30px">Toutes les entrées sont terminées ✓</div></td></tr>`;
+
+  if (done.length) {
+    tbodyDone.innerHTML = done.map(rowHtml).join('');
+    if (doneCount) doneCount.textContent = done.length;
+    if (doneSection) doneSection.style.display = '';
+    tbodyDone.style.display = doneVisible ? '' : 'none';
+  } else {
+    if (doneSection) doneSection.style.display = 'none';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DAY VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+function renderDay() {
+  const grid  = document.getElementById('day-grid');
+  const title = document.getElementById('day-title');
+  const d = agendaDate;
+  title.textContent = d.toLocaleDateString('fr-FR', {weekday:'long',day:'numeric',month:'long',year:'numeric'});
+  const dayStr = d.toISOString().slice(0,10);
+  const now = new Date(); const nowH = now.getHours();
+  let html = '';
+  for (let h = 7; h <= 19; h++) {
+    const isNow = d.toDateString() === now.toDateString() && h === nowH;
+    const evs = entries.filter(e => {
+      if (!e.created_at) return false;
+      const ed = e.created_at.slice(0,10);
+      const eh = parseInt(e.created_at.slice(11,13)||'0');
+      return ed === dayStr && eh === h;
+    });
+    html += `<div class="day-slot ${isNow?'slot-now':''}">
+      <div class="slot-hour ${isNow?'now-hour':''}">${String(h).padStart(2,'0')}h</div>
+      <div class="slot-events">${evs.map(e => `
+        <div class="agenda-chip prio-${e.priorite}" onclick="editEntry('${e.id}')" style="flex:0 0 auto;min-width:180px;max-width:280px">
+          <div class="chip-top">${esc(e.objet||'(sans objet)')}</div>
+          <div class="chip-sub">${[e.prenom,e.service,e.canal].filter(Boolean).map(esc).join(' · ')}</div>
+        </div>`).join('')}</div>
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+
+function agendaNav(dir) {
+  agendaDate = new Date(agendaDate);
+  agendaDate.setDate(agendaDate.getDate() + dir);
+  renderDay();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WEEK VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+function renderWeek() {
+  const grid  = document.getElementById('week-grid');
+  const title = document.getElementById('week-title');
+  const today = new Date();
+  const base  = new Date(today);
+  base.setDate(base.getDate() - base.getDay() + 1 + weekOffset*7);
+  const days = Array.from({length:5}, (_,i) => { const d=new Date(base); d.setDate(base.getDate()+i); return d; });
+  title.textContent = `Semaine du ${days[0].toLocaleDateString('fr-FR',{day:'numeric',month:'long'})} au ${days[4].toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'})}`;
+  const isToday = d => d.toDateString() === today.toDateString();
+  let header = '<div class="week-header" style="grid-template-columns: 50px repeat(5, 1fr)"><div class="week-header-cell"></div>';
+  days.forEach(d => {
+    header += `<div class="week-header-cell ${isToday(d)?'today':''}">${d.toLocaleDateString('fr-FR',{weekday:'short',day:'numeric',month:'short'})}</div>`;
+  });
+  header += '</div>';
+  let body = '<div class="week-body">';
+  for (let h=7; h<=19; h++) {
+    body += `<div class="week-row" style="grid-template-columns: 50px repeat(5, 1fr)">`;
+    body += `<div class="week-cell"><div class="week-hour">${String(h).padStart(2,'0')}h</div></div>`;
+    days.forEach(d => {
+      const ds = d.toISOString().slice(0,10);
+      const evs = entries.filter(e => e.created_at && e.created_at.slice(0,10)===ds && parseInt(e.created_at.slice(11,13)||'0')===h);
+      body += `<div class="week-cell">${evs.map(e => `
+        <div class="week-chip prio-${e.priorite}" onclick="editEntry('${e.id}')" title="${esc(e.objet||'')}">${esc(e.objet||e.type_demande||'…')}</div>`).join('')}</div>`;
+    });
+    body += '</div>';
+  }
+  body += '</div>';
+  grid.innerHTML = header + body;
+}
+
+function weekNav(dir) { weekOffset += dir; renderWeek(); }
+function goToday() { agendaDate = new Date(); weekOffset = 0; renderCurrent(); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SIDEBAR
+// ═══════════════════════════════════════════════════════════════════════════
+// Synchronise les options du <select> Statut avec les colonnes Kanban actuelles
+function syncStatutSelect() {
+  const sel = document.getElementById('f-statut-sb');
+  if (!sel) return;
+  const cols = kanbanColumns.length ? kanbanColumns : [
+    { slug: 'todo',       label: 'À faire' },
+    { slug: 'inprogress', label: 'En cours' },
+    { slug: 'done',       label: 'Terminé' },
+  ];
+  sel.innerHTML = cols.map(c => `<option value="${esc(c.slug)}">${esc(c.label)}</option>`).join('');
+}
+
+function openSidebar(entry=null) {
+  syncStatutSelect();
+  const now = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  const localNow = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  document.getElementById('sb-title').textContent           = entry ? "Modifier l'entrée" : 'Nouvelle entrée';
+  document.getElementById('edit-id').value                  = entry ? entry.id : '';
+  document.getElementById('f-datetime').value               = entry ? (entry.created_at||'').slice(0,16).replace(' ','T') : localNow;
+  document.getElementById('f-canal-sb').value               = entry ? entry.canal||'' : '';
+  document.getElementById('f-type_demande').value           = entry ? entry.type_demande||'' : '';
+  document.getElementById('f-prenom-sb').value              = entry ? entry.prenom||'' : '';
+  document.getElementById('f-service-sb').value             = entry ? entry.service||'' : '';
+  document.getElementById('f-objet').value                  = entry ? entry.objet||'' : '';
+  document.getElementById('f-categorie').value              = entry ? entry.categorie||'' : '';
+  document.getElementById('f-priorite').value               = entry ? entry.priorite||'normal' : 'normal';
+  document.getElementById('f-statut-sb').value              = entry ? entry.statut||'todo' : 'todo';
+  document.getElementById('f-commentaire').value            = entry ? entry.commentaire||'' : '';
+  document.getElementById('sidebar').classList.add('open');
+  setTimeout(() => document.getElementById('f-canal-sb').focus(), 280);
+}
+
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+}
+
+async function saveEntry() {
+  const btn = document.getElementById('btn-save');
+  btn.disabled = true;
+  btn.textContent = 'Enregistrement…';
+
+  try {
+    const id = document.getElementById('edit-id').value;
+    const dt = document.getElementById('f-datetime').value;
+    const data = {
+      created_at:   dt ? dt.replace('T',' ')+':00' : null,
+      canal:        document.getElementById('f-canal-sb').value,
+      type_demande: document.getElementById('f-type_demande').value,
+      prenom:       document.getElementById('f-prenom-sb').value,
+      service:      document.getElementById('f-service-sb').value,
+      objet:        document.getElementById('f-objet').value,
+      categorie:    document.getElementById('f-categorie').value,
+      priorite:     document.getElementById('f-priorite').value,
+      statut:       document.getElementById('f-statut-sb').value,
+      commentaire:  document.getElementById('f-commentaire').value,
+    };
+    if (id) {
+      await window._fb.updateEntry(id, data);
+      toast('Entrée mise à jour ✓');
+    } else {
+      await window._fb.addEntry(data);
+      toast('Entrée enregistrée ✓');
+    }
+    invalidateAc();
+    closeSidebar();
+    await load();
+  } catch (err) {
+    console.error(err);
+    toast('Erreur : ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Enregistrer';
+  }
+}
+
+function editEntry(id) {
+  const e = entries.find(x => x.id === id);
+  if (e) openSidebar(e);
+}
+
+async function deleteEntry(id) {
+  if (!confirm('Supprimer cette entrée ?')) return;
+  await window._fb.deleteEntry(id);
+  toast('Entrée supprimée');
+  await load();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  KANBAN
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadKanbanColumns() {
+  kanbanColumns = await window._fb.getCols();
+  syncStatutSelect();
+  syncStatutFilter();
+}
+
+function syncStatutFilter() {
+  const sel = document.getElementById('f-statut');
+  if (!sel) return;
+  const cur = sel.value;
+  const cols = kanbanColumns.length ? kanbanColumns : [
+    { slug: 'todo',       label: 'À faire' },
+    { slug: 'inprogress', label: 'En cours' },
+    { slug: 'done',       label: 'Terminé' },
+  ];
+  sel.innerHTML = '<option value="">Statut : Tous</option>' +
+    cols.map(c => `<option value="${esc(c.slug)}" ${c.slug === cur ? 'selected' : ''}>${esc(c.label)}</option>`).join('');
+}
+
+async function renderKanban() {
+  if (!kanbanColumns.length) await loadKanbanColumns();
+  const wrap = document.getElementById('kanban-wrap');
+  const map  = {};
+  kanbanColumns.forEach(c => map[c.slug] = []);
+  entries.forEach(e => {
+    const slug = e.statut || 'todo';
+    if (!map[slug]) map[slug] = [];
+    (map[slug] || map['todo']).push(e);
+  });
+  wrap.innerHTML = '';
+  kanbanColumns.forEach(col => {
+    const cards = map[col.slug] || [];
+    const colEl = document.createElement('div');
+    colEl.className = 'kanban-col';
+    colEl.dataset.colId   = col.id;
+    colEl.dataset.colSlug = col.slug;
+    colEl.dataset.fixed   = col.is_fixed;
+
+    colEl.innerHTML = `
+      <div class="kanban-col-header" draggable="true">
+        <div class="kanban-col-title" id="kct-${col.id}">${esc(col.label)}</div>
+        <div class="kanban-col-count">${cards.length}</div>
+        <div class="kanban-col-actions">
+          <button class="kbtn" title="Renommer" onclick="startRename('${col.id}')">✎</button>
+          ${col.is_fixed ? '' : `<button class="kbtn del" title="Supprimer" onclick="deleteCol('${col.id}')">✕</button>`}
+        </div>
+      </div>
+      <div class="kanban-cards" id="kcards-${col.id}"></div>`;
+
+    const cardsEl = colEl.querySelector('.kanban-cards');
+    cardsEl.addEventListener('dragover',  e => { e.preventDefault(); colEl.classList.add('drag-over'); });
+    cardsEl.addEventListener('dragleave', e => { if (!colEl.contains(e.relatedTarget)) colEl.classList.remove('drag-over'); });
+    cardsEl.addEventListener('drop', onCardDrop);
+
+    const header = colEl.querySelector('.kanban-col-header');
+    header.addEventListener('dragstart', e => onColDragStart(e, col.id));
+    header.addEventListener('dragend',   onColDragEnd);
+    colEl.addEventListener('dragover', e => { if (dragCol !== null) { e.preventDefault(); onColDragOver(e, colEl); } });
+    colEl.addEventListener('drop', e => { if (dragCol !== null) onColDrop(e, col.id); });
+
+    if (!cards.length) {
+      cardsEl.innerHTML = `<div class="kanban-empty">Aucune carte<br>Glissez ici</div>`;
+    } else {
+      cards.forEach(e => cardsEl.appendChild(buildCard(e)));
+    }
+    wrap.appendChild(colEl);
+  });
+
+  if (!addingCol) {
+    const addBtn = document.createElement('div');
+    addBtn.className = 'kanban-add-col';
+    addBtn.innerHTML = `<div class="kanban-add-col-icon">＋</div><div class="kanban-add-col-text">Ajouter une colonne</div>`;
+    addBtn.onclick = showAddColForm;
+    wrap.appendChild(addBtn);
+  } else {
+    const form = document.createElement('div');
+    form.className = 'kanban-add-col-form';
+    form.innerHTML = `
+      <input type="text" id="new-col-input" placeholder="Nom de la colonne…" maxlength="40">
+      <div class="kanban-add-col-form-btns">
+        <button class="btn-save" style="padding:6px 10px;font-size:12px" onclick="confirmAddCol()">Ajouter</button>
+        <button class="btn-cancel" style="padding:6px 10px;font-size:12px" onclick="cancelAddCol()">Annuler</button>
+      </div>`;
+    wrap.appendChild(form);
+    setTimeout(() => document.getElementById('new-col-input')?.focus(), 50);
+  }
+}
+
+function buildCard(e) {
+  const card = document.createElement('div');
+  card.className = 'kanban-card';
+  card.draggable = true;
+  card.dataset.entryId = e.id;
+  const date = e.created_at ? e.created_at.slice(0,10) : '';
+  const tags = [e.canal, e.service, e.type_demande].filter(Boolean);
+  card.innerHTML = `
+    <button class="kcard-edit" onclick="event.stopPropagation();editEntry('${e.id}')" title="Modifier">✎</button>
+    <div class="kcard-top">
+      <div class="kcard-objet">${esc(e.objet||'(sans objet)')}</div>
+      <div class="kcard-prio ${e.priorite||'normal'}"></div>
+    </div>
+    ${e.prenom ? `<div class="kcard-meta">${esc(e.prenom)}${e.service?` · ${esc(e.service)}`:''}</div>` : ''}
+    ${tags.length ? `<div class="kcard-meta" style="margin-top:4px">${tags.map(t=>`<span class="kcard-tag">${esc(t)}</span>`).join('')}</div>` : ''}
+    ${date ? `<div class="kcard-date">${date}</div>` : ''}`;
+  card.addEventListener('dragstart', onCardDragStart);
+  card.addEventListener('dragend',   onCardDragEnd);
+  return card;
+}
+
+// Drag & Drop — cartes
+function onCardDragStart(e) {
+  if (dragCol !== null) { e.preventDefault(); return; }
+  dragCard = this.dataset.entryId;
+  this.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', dragCard);
+}
+function onCardDragEnd() {
+  dragCard = null;
+  this.classList.remove('dragging');
+  document.querySelectorAll('.kanban-col').forEach(c => c.classList.remove('drag-over'));
+}
+async function onCardDrop(e) {
+  e.preventDefault();
+  const colEl = e.currentTarget.closest('.kanban-col');
+  colEl.classList.remove('drag-over');
+  if (dragCard === null) return;
+  const newSlug = colEl.dataset.colSlug;
+  await window._fb.patchStatut(dragCard, newSlug);
+  await load();
+}
+
+// Drag & Drop — colonnes
+let colDragOver = null;
+function onColDragStart(e, colId) {
+  if (dragCard !== null) { e.preventDefault(); return; }
+  dragCol = colId;
+  e.currentTarget.closest('.kanban-col').classList.add('col-dragging');
+  e.dataTransfer.effectAllowed = 'move';
+}
+function onColDragEnd() {
+  dragCol = null;
+  document.querySelectorAll('.kanban-col').forEach(c => c.classList.remove('col-dragging','drag-over'));
+}
+function onColDragOver(e, colEl) {
+  e.preventDefault();
+  colDragOver = colEl.dataset.colId;
+}
+async function onColDrop(e, targetColId) {
+  e.preventDefault();
+  if (dragCol === null || dragCol === targetColId) return;
+  const srcCol = kanbanColumns.find(c => c.id === dragCol);
+  const tgtCol = kanbanColumns.find(c => c.id === targetColId);
+  if (!srcCol || !tgtCol) return;
+  const tmp = srcCol.position; srcCol.position = tgtCol.position; tgtCol.position = tmp;
+  await window._fb.reorderCols(kanbanColumns.map(c => ({id: c.id, position: c.position})));
+  kanbanColumns.sort((a,b) => a.position - b.position);
+  renderKanban();
+}
+
+// Gestion colonnes
+function showAddColForm()  { addingCol = true;  renderKanban(); }
+function cancelAddCol()    { addingCol = false; renderKanban(); }
+
+async function confirmAddCol() {
+  const inp = document.getElementById('new-col-input');
+  const label = inp?.value?.trim();
+  if (!label) return;
+  const col = await window._fb.addCol(label);
+  kanbanColumns.push(col);
+  addingCol = false;
+  await load();
+}
+
+async function deleteCol(id) {
+  const col = kanbanColumns.find(c => c.id === id);
+  if (!col) return;
+  if (!confirm(`Supprimer la colonne "${col.label}" ?\nLes cartes seront remises dans "À faire".`)) return;
+  await window._fb.deleteCol(id, col.slug);
+  kanbanColumns = kanbanColumns.filter(c => c.id !== id);
+  await load();
+}
+
+async function startRename(id) {
+  const col = kanbanColumns.find(c => c.id === id);
+  if (!col) return;
+  const titleEl = document.getElementById('kct-' + id);
+  if (!titleEl) return;
+  const inp = document.createElement('input');
+  inp.className = 'kanban-col-title-input';
+  inp.value = col.label;
+  titleEl.replaceWith(inp);
+  inp.focus(); inp.select();
+  const commit = async () => {
+    const newLabel = inp.value.trim();
+    if (newLabel && newLabel !== col.label) {
+      const newSlug = await window._fb.updateCol(id, newLabel, col.slug, col.is_fixed);
+      col.label = newLabel;
+      if (newSlug) col.slug = newSlug;
+    }
+    await load();
+  };
+  inp.addEventListener('blur',    commit);
+  inp.addEventListener('keydown', e => { if (e.key==='Enter') inp.blur(); if (e.key==='Escape') load(); });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  STATS VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+async function renderStats() {
+  const dash = document.getElementById('stats-dashboard');
+  dash.innerHTML = `<div class="stats-loading"><div class="spin"></div><span>Chargement des statistiques…</span></div>`;
+
+  const allEntries = await window._fb.getEntries();
+
+  function countBy(field) {
+    const map = {};
+    allEntries.forEach(e => {
+      const v = e[field] || '(non renseigné)';
+      map[v] = (map[v] || 0) + 1;
+    });
+    return Object.entries(map).sort((a,b) => b[1]-a[1]);
+  }
+
+  const byStatut    = countBy('statut');
+  const byService   = countBy('service');
+  const byType      = countBy('type_demande');
+  const byCategorie = countBy('categorie');
+  const byPrenom    = countBy('prenom');
+  const byObjet     = countBy('objet');
+  const byCanal     = countBy('canal');
+  const total       = allEntries.length;
+
+  if (!total) {
+    dash.innerHTML = `<div class="no-data" style="grid-column:1/-1;padding:80px">Aucune donnée disponible.<br><small>Créez des entrées pour voir les statistiques.</small></div>`;
+    return;
+  }
+
+  // Palette
+  const PALETTE = ['#2563eb','#16a34a','#d97706','#7c3aed','#db2777','#0891b2','#ea580c','#65a30d','#6366f1','#f59e0b'];
+  const STATUT_COLORS = { todo:'#6b7280', inprogress:'#2563eb', waiting:'#d97706', done:'#16a34a' };
+  const STATUT_LABELS = { todo:'À faire', inprogress:'En cours', waiting:'En attente', done:'Terminé' };
+
+  function pct(n) { return total ? Math.round(n/total*100) : 0; }
+
+  // ── 1. DONUT — Statut ──────────────────────────────────────────────────
+  function buildDonut(data, colorFn, labelFn) {
+    const SIZE = 130, R = 44, cx = SIZE/2, cy = SIZE/2, stroke = 16;
+    const circumference = 2 * Math.PI * R;
+    const tot = data.reduce((s,[,v]) => s+v, 0);
+    // Approche correcte : un seul arc par segment, dashoffset positionne le début
+    // L'arc démarre en haut (noon = -π/2), on accumule consumed en fraction [0,1]
+    let consumed = 0;
+    let paths = '';
+    data.forEach(([key, val]) => {
+      const frac = val / tot;
+      const dashLen = frac * circumference;
+      // dashoffset positif = recule le début de l'arc
+      // Pour démarrer à 12h : offset = C/4 - consumed*C
+      const dashOffset = (circumference / 4) - consumed * circumference;
+      const color = colorFn(key);
+      paths += `<circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="${color}"
+        stroke-width="${stroke}"
+        stroke-dasharray="${dashLen.toFixed(2)} ${(circumference - dashLen).toFixed(2)}"
+        stroke-dashoffset="${dashOffset.toFixed(2)}">
+        <title>${labelFn(key)}: ${val}</title></circle>`;
+      consumed += frac;
+    });
+    return `<svg width="${SIZE}" height="${SIZE}" viewBox="0 0 ${SIZE} ${SIZE}">
+      ${paths}
+      <text x="${cx}" y="${cy-5}" text-anchor="middle" fill="var(--text)" font-size="20" font-weight="700" font-family="DM Sans,sans-serif">${tot}</text>
+      <text x="${cx}" y="${cy+11}" text-anchor="middle" fill="var(--text3)" font-size="9" font-family="DM Sans,sans-serif">demandes</text>
+    </svg>`;
+  }
+
+  const donutSvg = buildDonut(byStatut,
+    (k) => STATUT_COLORS[k] || '#94a3b8',
+    (k) => STATUT_LABELS[k] || k
+  );
+  const donutLegend = byStatut.map(([key,val],i) => `
+    <div class="donut-leg-item">
+      <div class="donut-leg-dot" style="background:${STATUT_COLORS[key]||'#94a3b8'}"></div>
+      <span class="donut-leg-label">${STATUT_LABELS[key]||key}</span>
+      <span class="donut-leg-val">${val}</span>
+      <span class="donut-leg-pct">${pct(val)}%</span>
+    </div>`).join('');
+
+  // ── 2. BARRES HORIZONTALES — Service ───────────────────────────────────
+  function buildHBars(data, maxItems, colorFn) {
+    const items = data.slice(0, maxItems);
+    const maxVal = items[0]?.[1] || 1;
+    return `<div class="hbar-list">${items.map(([key,val],i) => `
+      <div class="hbar-item">
+        <div class="hbar-header">
+          <span class="hbar-label">${esc(key)}</span>
+          <span class="hbar-val">${val} · ${pct(val)}%</span>
+        </div>
+        <div class="hbar-track">
+          <div class="hbar-fill" style="width:${Math.round(val/maxVal*100)}%;background:${colorFn(i)}"></div>
+        </div>
+      </div>`).join('')}</div>`;
+  }
+
+  // ── 3. BARRES VERTICALES — Type de demande ─────────────────────────────
+  function buildVBars(data, maxItems) {
+    const items = data.slice(0, maxItems);
+    const maxVal = items[0]?.[1] || 1;
+    return `<div style="position:relative">
+      <div class="vbar-wrap">${items.map(([key,val],i) => {
+        const h = Math.max(8, Math.round(val/maxVal*110));
+        return `<div class="vbar-item" style="position:relative">
+          <span class="vbar-val">${val}</span>
+          <div class="vbar-bar" style="height:${h}px;background:${PALETTE[i%PALETTE.length]}" data-tip="${esc(key)}: ${val}"></div>
+          <span class="vbar-lbl">${esc(key.length>10?key.slice(0,9)+'…':key)}</span>
+        </div>`;
+      }).join('')}</div>
+    </div>`;
+  }
+
+  // ── 4. PIE — Canal ─────────────────────────────────────────────────────
+  function buildPie(data) {
+    const SIZE = 130, cx = SIZE/2, cy = SIZE/2, R = 55;
+    const tot = data.reduce((s,[,v]) => s+v, 0);
+    let angle = -Math.PI/2;
+    let paths = '';
+    data.forEach(([key,val],i) => {
+      const slice = (val/tot) * 2 * Math.PI;
+      const x1 = cx + R * Math.cos(angle);
+      const y1 = cy + R * Math.sin(angle);
+      const x2 = cx + R * Math.cos(angle + slice);
+      const y2 = cy + R * Math.sin(angle + slice);
+      const large = slice > Math.PI ? 1 : 0;
+      const color = PALETTE[i % PALETTE.length];
+      paths += `<path d="M${cx},${cy} L${x1},${y1} A${R},${R} 0 ${large} 1 ${x2},${y2} Z" fill="${color}" stroke="var(--surface)" stroke-width="2">
+        <title>${esc(key)}: ${val}</title></path>`;
+      angle += slice;
+    });
+    return `<svg width="${SIZE}" height="${SIZE}" viewBox="0 0 ${SIZE} ${SIZE}">${paths}</svg>`;
+  }
+
+  const pieSvg = buildPie(byCanal);
+  const pieLegend = byCanal.slice(0,8).map(([key,val],i) => `
+    <div class="pie-leg-item">
+      <div class="pie-leg-dot" style="background:${PALETTE[i%PALETTE.length]}"></div>
+      <span class="pie-leg-label">${esc(key)}</span>
+      <span class="pie-leg-val">${val}</span>
+    </div>`).join('');
+
+  // ── 5. RANKING — Prénom ────────────────────────────────────────────────
+  function buildRanking(data, maxItems) {
+    const items = data.slice(0, maxItems);
+    const maxVal = items[0]?.[1] || 1;
+    const medals = ['🥇','🥈','🥉'];
+    return `<div class="ranking-list">${items.map(([key,val],i) => {
+      const initials = key.split(' ').map(w=>w[0]||'').join('').toUpperCase().slice(0,2);
+      return `<div class="rank-item">
+        <div class="rank-num">${medals[i] || i+1}</div>
+        <div class="rank-avatar">${initials||'?'}</div>
+        <div class="rank-name">${esc(key)}</div>
+        <div class="rank-bar-wrap"><div class="rank-bar-track"><div class="rank-bar-fill" style="width:${Math.round(val/maxVal*100)}%"></div></div></div>
+        <div class="rank-val">${val}</div>
+      </div>`;
+    }).join('')}</div>`;
+  }
+
+  // ── 6. TREEMAP — Catégorie ─────────────────────────────────────────────
+  function buildTreemap(data) {
+    if (!data.length) return `<div class="no-data">Aucune catégorie</div>`;
+    const items = data.slice(0,12);
+    const tot = items.reduce((s,[,v])=>s+v,0);
+    // Simple squarified layout (row-based approximation)
+    const W = 100, H = 100;
+    let cells = [], x = 0, y = 0;
+    // Split into 2 rows
+    const half = Math.ceil(items.length/2);
+    const row1 = items.slice(0,half), row2 = items.slice(half);
+    const tot1 = row1.reduce((s,[,v])=>s+v,0);
+    const tot2 = row2.reduce((s,[,v])=>s+v,0);
+    const h1 = tot1/(tot1+tot2)*100, h2 = 100-h1;
+    let cx = 0;
+    row1.forEach(([key,val],i) => {
+      const w = val/tot1*100;
+      cells.push({key,val,x:cx,y:0,w,h:h1,color:PALETTE[i%PALETTE.length]});
+      cx += w;
+    });
+    cx = 0;
+    row2.forEach(([key,val],i) => {
+      const w = val/tot2*100;
+      cells.push({key,val,x:cx,y:h1,w,h:h2,color:PALETTE[(i+half)%PALETTE.length]});
+      cx += w;
+    });
+    return `<div class="treemap-wrap">${cells.map(c => `
+      <div class="treemap-cell" title="${esc(c.key)}: ${c.val}" style="
+        left:${c.x.toFixed(2)}%;top:${c.y.toFixed(2)}%;
+        width:${c.w.toFixed(2)}%;height:${c.h.toFixed(2)}%;
+        background:${c.color}">
+        ${c.w > 8 ? `<span class="treemap-cell-label">${esc(c.key.length>14?c.key.slice(0,13)+'…':c.key)}</span>` : ''}
+        ${c.w > 12 ? `<span class="treemap-cell-val">${c.val}</span>` : ''}
+      </div>`).join('')}</div>`;
+  }
+
+  // ── 7. BARRES — Objet (top 10) ─────────────────────────────────────────
+  const objTop = byObjet.slice(0,10);
+
+  // ── 8. HEATMAP — Horaires (7h–19h, Lun–Dim) ────────────────────────────
+  function buildHeatmap(entries) {
+    const DAYS  = ['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'];
+    const H_START = 7, H_END = 19; // plage horaire visible
+    const HOURS = H_END - H_START; // 12 colonnes
+
+    // grid[dayOfWeek 0=Lun..6=Dim][hourIndex 0..11]
+    const grid = Array.from({length:7}, () => new Array(HOURS).fill(0));
+
+    entries.forEach(e => {
+      if (!e.created_at) return;
+      const d = new Date(e.created_at.replace(' ', 'T'));
+      if (isNaN(d)) return;
+      let dow = d.getDay();            // 0=Dim
+      dow = dow === 0 ? 6 : dow - 1;  // 0=Lun … 6=Dim
+      const h = d.getHours();
+      if (h >= H_START && h < H_END) {
+        grid[dow][h - H_START]++;
+      }
+    });
+
+    const maxVal = Math.max(1, ...grid.flat());
+
+    // Warm color scale: bleu clair → jaune → orange → rouge
+    function cellColor(v) {
+      if (v === 0) return { bg: 'var(--surface2)', text: 'transparent' };
+      const t = v / maxVal; // 0..1
+      // Interpolate through: #cce5ff → #ffe066 → #ff8c00 → #cc0000
+      let r, g, b;
+      if (t < 0.33) {
+        const u = t / 0.33;
+        r = Math.round(204 + (255-204)*u);
+        g = Math.round(229 + (224-229)*u);
+        b = Math.round(255 + (102-255)*u);
+      } else if (t < 0.66) {
+        const u = (t - 0.33) / 0.33;
+        r = 255;
+        g = Math.round(224 + (140-224)*u);
+        b = Math.round(102 + (0-102)*u);
+      } else {
+        const u = (t - 0.66) / 0.34;
+        r = Math.round(255 + (204-255)*u);
+        g = Math.round(140 + (0-140)*u);
+        b = 0;
+      }
+      const textColor = t > 0.55 ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.5)';
+      return { bg: `rgb(${r},${g},${b})`, text: textColor };
+    }
+
+    // Peak info
+    let peakVal = 0, peakDay = 0, peakHour = H_START;
+    grid.forEach((row, di) => row.forEach((v, hi) => {
+      if (v > peakVal) { peakVal = v; peakDay = di; peakHour = H_START + hi; }
+    }));
+    const hourTotals = Array(HOURS).fill(0);
+    grid.forEach(row => row.forEach((v,hi) => hourTotals[hi] += v));
+    const busyHours = hourTotals.map((v,hi)=>({h:H_START+hi,v})).filter(x=>x.v>0).sort((a,b)=>b.v-a.v).slice(0,3);
+
+    // Build HTML table (not CSS grid to avoid the layout bug)
+    let html = '<div class="heatmap-outer"><table class="heatmap-table"><thead><tr>';
+    html += '<th class="hm-corner"></th>';
+    for (let hi = 0; hi < HOURS; hi++) {
+      html += `<th class="hm-hour-label">${H_START + hi}h</th>`;
+    }
+    html += '</tr></thead><tbody>';
+
+    for (let di = 0; di < 7; di++) {
+      html += `<tr><td class="hm-day-label">${DAYS[di]}</td>`;
+      for (let hi = 0; hi < HOURS; hi++) {
+        const v = grid[di][hi];
+        const {bg, text} = cellColor(v);
+        const tip = `${DAYS[di]} ${H_START+hi}h–${H_START+hi+1}h : ${v} dem.`;
+        html += `<td title="${tip}">
+          <div class="hm-cell"><div class="hm-cell-inner" style="background:${bg};color:${text}">${v||''}</div></div>
+        </td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+
+    // Peaks
+    const fh = h => `${h}h–${h+1}h`;
+    html += `<div class="heatmap-peaks">
+      ${peakVal > 0 ? `<div class="hm-peak-badge">⚡ Pic : <strong>${DAYS[peakDay]} ${fh(peakHour)}</strong> — ${peakVal} dem.</div>` : ''}
+      ${busyHours.slice(0,3).map(({h,v}) => `<div class="hm-peak-badge">🕐 ${fh(h)} · <strong>${v}</strong> dem.</div>`).join('')}
+    </div>`;
+
+    // Legend
+    const steps = [0, 0.25, 0.5, 0.75, 1].map(t => {
+      if (t === 0) return 'var(--surface2)';
+      const v = Math.round(t * maxVal);
+      return cellColor(v).bg;
+    });
+    html += `<div class="heatmap-legend-row">
+      <span>0</span>
+      ${steps.map(c=>`<div class="hm-leg-box" style="background:${c}"></div>`).join('')}
+      <span>${maxVal} max</span>
+    </div>`;
+
+    return html;
+  }
+
+    // ── ASSEMBLE ───────────────────────────────────────────────────────────
+  dash.innerHTML = `
+    <!-- Donut statut -->
+    <div class="stat-card">
+      <div class="stat-card-title"><span>🔵</span> Répartition par statut <span class="stat-card-total">${total} total</span></div>
+      <div class="donut-wrap">
+        ${donutSvg}
+        <div class="donut-legend">${donutLegend}</div>
+      </div>
+    </div>
+
+    <!-- Pie canal -->
+    <div class="stat-card">
+      <div class="stat-card-title"><span>📡</span> Demandes par canal</div>
+      <div class="pie-wrap">
+        ${pieSvg}
+        <div class="pie-legend">${pieLegend}</div>
+      </div>
+    </div>
+
+    <!-- Barres horizontales service -->
+    <div class="stat-card">
+      <div class="stat-card-title"><span>🏢</span> Demandes par service</div>
+      ${byService.length ? buildHBars(byService, 8, i => PALETTE[i%PALETTE.length]) : '<div class="no-data">Aucune donnée</div>'}
+    </div>
+
+    <!-- Ranking prénom -->
+    <div class="stat-card">
+      <div class="stat-card-title"><span>👤</span> Top demandeurs</div>
+      ${byPrenom.length ? buildRanking(byPrenom, 7) : '<div class="no-data">Aucune donnée</div>'}
+    </div>
+
+    <!-- Barres verticales type de demande -->
+    <div class="stat-card">
+      <div class="stat-card-title"><span>📂</span> Par type de demande</div>
+      ${byType.length ? buildVBars(byType, 8) : '<div class="no-data">Aucune donnée</div>'}
+    </div>
+
+    <!-- Treemap catégorie -->
+    <div class="stat-card">
+      <div class="stat-card-title"><span>🏷</span> Par catégorie</div>
+      ${buildTreemap(byCategorie)}
+    </div>
+
+    <!-- Barres horizontales objet top 10 -->
+    <div class="stat-card wide">
+      <div class="stat-card-title"><span>📋</span> Top 10 objets les plus fréquents</div>
+      ${objTop.length ? buildHBars(objTop, 10, i => `hsl(${220 + i*12},70%,${55-i*2}%)`) : '<div class="no-data">Aucune donnée</div>'}
+    </div>
+
+    <!-- Heatmap horaires - full width -->
+    <div class="stat-card" style="grid-column:1/-1">
+      <div class="stat-card-title"><span>🕐</span> Activité par heure & jour — quand êtes-vous dérangée ?</div>
+      <div class="heatmap-wrap">${buildHeatmap(allEntries)}</div>
+    </div>	
+  `;
+}
+
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function prioLabel(p)   { return {urgent:'🔴 Urgent', normal:'Normal', faible:'Faible'}[p] || p; }
+function statutLabel(s) { return {todo:'À faire', inprogress:'En cours', done:'Terminé'}[s] || s; }
+
+function slugify(str) {
+  return str.toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-z0-9]+/g,'_')
+    .replace(/^_|_$/g,'')
+    .substring(0,40) || 'col_' + Date.now();
+}
+
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2200);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeSidebar();
+  if (e.key === 'n' && !e.ctrlKey && !e.metaKey && document.activeElement.tagName === 'BODY') openSidebar();
+});
+</script>
+</body>
+</html>
